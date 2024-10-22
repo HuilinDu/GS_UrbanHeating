@@ -1,0 +1,112 @@
+
+var urban = ee.FeatureCollection("users/continental/GRL_urban5643")
+//print("urban",urban)
+
+var citylist = urban.aggregate_array('ORIG_FID')
+//print("citylist",citylist)
+
+
+// EVIdata
+var bitwiseExtract = function(input, fromBit, toBit){
+      var maskSize = ee.Number(1).add(toBit).subtract(fromBit)
+      var mask = ee.Number(1).leftShift(maskSize).subtract(1)
+      return input.rightShift(fromBit).bitwiseAnd(mask)
+}
+
+var qualityControl = function(image){
+      var lstErrorMask = bitwiseExtract(image.select('DetailedQA'), 0, 1).eq(0)
+      return image.select('EVI').updateMask(lstErrorMask)  
+}
+
+// convert the unit of EVI
+var convertUnit_EVI = function(image){
+  return image.multiply(0.0001).copyProperties(image,['system:time_start','system:time_end'])
+}
+
+
+// masking pixels identified as water and so on
+var igbpLandCover = ee.Image('MODIS/061/MCD12Q1/2020_01_01').select('LC_Type1')
+var urban_LandCover = igbpLandCover.updateMask(igbpLandCover.neq(11).and(igbpLandCover.neq(15)).and(igbpLandCover.neq(17)))
+var maskIGBP = function(image){
+  return image.updateMask(urban_LandCover)
+}
+
+var year_list = ee.List.sequence(2003,2022)
+var season_list = ee.List.sequence(3,12,3)
+
+
+var bandname = year_list.map(function(year){
+  return ee.String(year).slice(0,4)
+})
+//print("bandname",bandname)
+
+var outputSelectors = ee.List(['ORIG_FID']).cat(bandname).getInfo()
+//print("outputSelectors",outputSelectors)
+
+var EVIVis = {
+  min: 0.1, 
+  max: 0.5, 
+  palette: ['040274', '0602ff', '3be285', 'fff705', 'ff0000', '911003'
+  ]
+}
+
+var EVI = ee.ImageCollection("MODIS/061/MOD13A2")
+            .select('EVI')
+            .map(maskIGBP)
+            //.map(qualityControl)
+            .map(convertUnit_EVI)
+//print("EVI",EVI)
+
+
+// first seasonal mean EVI, then yearly mean EVI
+var yearly_EVI_JunetoAugust = ee.ImageCollection.fromImages(year_list.map(function(year){
+      year = ee.Number(year)
+      return EVI.filterDate(ee.Date.fromYMD(year,6,1),ee.Date.fromYMD(year,9,1)).mean()
+                .set('system:time_start',ee.Date.fromYMD(year,1,1).millis())
+      })).toBands().rename(bandname)
+print("yearly_EVI_JunetoAugust",yearly_EVI_JunetoAugust)
+
+
+var yearly_EVI_DecembertoFebrary = ee.ImageCollection.fromImages(year_list.map(function(year){
+      year = ee.Number(year)
+      return EVI.filterDate(ee.Date.fromYMD(year,12,1),ee.Date.fromYMD(year.add(1),3,1)).mean()
+                .set('system:time_start',ee.Date.fromYMD(year,1,1).millis())
+      })).toBands().rename(bandname)
+print("yearly_EVI_DecembertoFebrary",yearly_EVI_DecembertoFebrary)
+
+var NH = ee.Image.pixelLonLat().select("latitude").gte(0)
+var SH = ee.Image.pixelLonLat().select("latitude").lt(0)
+
+var yearly_EVIsummer_NH = yearly_EVI_JunetoAugust.updateMask(NH)
+var yearly_EVIsummer_SH = yearly_EVI_DecembertoFebrary.updateMask(SH)
+
+var yearly_EVI = ee.ImageCollection([yearly_EVIsummer_NH,yearly_EVIsummer_SH]).mosaic()
+print("yearly_EVI",yearly_EVI)
+
+
+
+for(var j=0;j<5643;j+=30){   
+    
+    var ID_group = citylist.slice(j,j+30)
+    //print(ID_group)
+    
+    var final_fc = ee.FeatureCollection(ID_group.map(function(city_i){
+
+          var urban_i = urban.filter(ee.Filter.eq('ORIG_FID', city_i)).first()
+          
+          var yearly_EVIurban = yearly_EVI.reduceRegion(ee.Reducer.mean(),ee.Feature(urban_i).geometry(),1000,null,null,false,10e12,4)
+
+          return ee.Feature(null,yearly_EVIurban).set('ORIG_FID',city_i)
+                                  
+}))
+    print("final_fc",final_fc)
+    
+    Export.table.toDrive({
+            collection: final_fc,
+            folder:"core_EVI_yearly_summer",
+            description: 'core_EVI_yearly_summer_'+j,
+            selectors: outputSelectors,
+            fileFormat: 'CSV'
+    })
+}    
+
