@@ -1,0 +1,433 @@
+
+// masking pixels identified as water and so on
+var igbpLandCover = ee.Image('MODIS/061/MCD12Q1/2020_01_01').select('LC_Type1')
+var urban_LandCover = igbpLandCover.updateMask(igbpLandCover.neq(11).and(igbpLandCover.neq(15)).and(igbpLandCover.neq(17)))
+var maskIGBP = function(image){
+  return image.updateMask(urban_LandCover)
+}
+
+
+var global_features = ee.FeatureCollection("projects/ee-continental/assets/HadISD_XY_HI_day_summer_03to22")
+                 .map(function(feature){
+                       var location = feature.geometry().coordinates()
+                       return feature.setMulti({'lati':location.get(1),'longi':location.get(0)})
+                 })
+//print("global_features",global_features.size())
+
+
+var global_urban_features = global_features.filter(ee.Filter.eq('UR',1))
+
+var SOUTH_urban_features = global_urban_features.filter(ee.Filter.eq('NS',200))
+//print("SOUTH_urban_features",SOUTH_urban_features.size())
+
+
+var classifier = ee.Classifier.smileRandomForest(100, null, 1, 0.5, null, 0).setOutputMode("REGRESSION")
+
+var independent_variable = ["year","lati", "longi", "elevation", 
+                            "LST","EVI", "WSA", "POP", "NTL",
+                            "reanalysisSAT", "reanalysisDPT","reanalysisPREP", "reanalysisRAD"]
+
+
+// global south
+var SOUTH_random_number = SOUTH_urban_features.aggregate_array('ID').shuffle()
+var SOUTH_training_ID = SOUTH_random_number.slice(0,SOUTH_urban_features.size().multiply(0.8).toInt())
+var SOUTH_trainingData = SOUTH_urban_features.filter(ee.Filter.inList("ID",SOUTH_training_ID))
+var SOUTH_rfModel = classifier.train(SOUTH_trainingData, "HI", independent_variable)
+print("SOUTH_rfModel",SOUTH_rfModel)
+
+
+// independent images
+var year_list = ee.List.sequence(2003,2022)
+var season_list = ee.List.sequence(3,12,3)
+
+var bandname = year_list.map(function(year){
+  return ee.String(year).slice(0,4)
+})
+//print("bandname",bandname)
+
+var outputSelectors = ee.List(['ORIG_FID']).cat(bandname).getInfo()
+//print("outputSelectors",outputSelectors)
+
+
+// Geolocation data
+var latitude = ee.Image.pixelLonLat().select('latitude').rename('lati')
+var longitude = ee.Image.pixelLonLat().select('longitude').rename('longi')
+var GTOPO30 = ee.Image("USGS/GTOPO30").select('elevation')
+
+var geolocation = latitude.addBands(longitude).addBands(GTOPO30)
+                          .resample('bilinear')
+                          .reproject({crs: ee.Image("MODIS/061/MYD11A2/2002_07_04").projection(),scale: 1000})
+
+//print("geolocation",geolocation)
+
+
+
+// LSTdata
+var bitwiseExtract = function(input, fromBit, toBit){
+      var maskSize = ee.Number(1).add(toBit).subtract(fromBit)
+      var mask = ee.Number(1).leftShift(maskSize).subtract(1)
+      return input.rightShift(fromBit).bitwiseAnd(mask)
+}
+
+var qualityControl = function(image){
+      var lstErrorMask = bitwiseExtract(image.select('QC_Day'), 6, 7).lte(2)
+      return image.select('LST_Day_1km').updateMask(lstErrorMask)  
+}
+
+var convertUnit = function(image){
+  return image.multiply(0.02).subtract(273.15)
+              .copyProperties(image,['system:time_start','system:time_end'])
+}
+
+var AquaLST = ee.ImageCollection('MODIS/061/MYD11A2')
+                .map(qualityControl)
+                .map(convertUnit)
+//print("AquaLST",AquaLST)                
+
+
+// first seasonal mean LST, then yearly mean LST
+var yearly_LST_JunetoAugust = ee.ImageCollection.fromImages(year_list.map(function(year){
+      year = ee.Number(year)
+      return AquaLST.filterDate(ee.Date.fromYMD(year,6,1),ee.Date.fromYMD(year,9,1)).mean()
+                    .set('system:time_start',ee.Date.fromYMD(year,1,1).millis())
+      })).toBands().rename(bandname)
+print("yearly_LST_JunetoAugust",yearly_LST_JunetoAugust)
+
+
+var yearly_LST_DecembertoFebrary = ee.ImageCollection.fromImages(year_list.map(function(year){
+      year = ee.Number(year)
+      return AquaLST.filterDate(ee.Date.fromYMD(year,12,1),ee.Date.fromYMD(year.add(1),3,1)).mean()
+                    .set('system:time_start',ee.Date.fromYMD(year,1,1).millis())
+      })).toBands().rename(bandname)
+print("yearly_LST_DecembertoFebrary",yearly_LST_DecembertoFebrary)
+
+var NH = ee.Image.pixelLonLat().select("latitude").gte(0)
+var SH = ee.Image.pixelLonLat().select("latitude").lt(0)
+
+var yearly_LSTsummer_NH = yearly_LST_JunetoAugust.updateMask(NH)
+var yearly_LSTsummer_SH = yearly_LST_DecembertoFebrary.updateMask(SH)
+
+var yearly_LST = ee.ImageCollection([yearly_LSTsummer_NH,yearly_LSTsummer_SH]).mosaic()
+print("yearly_LST",yearly_LST)
+
+
+
+
+
+// EVIdata
+var convertUnit_EVI = function(image){
+  return image.multiply(0.0001).copyProperties(image,['system:time_start','system:time_end'])
+}
+
+var EVI = ee.ImageCollection("MODIS/061/MOD13A2").select('EVI')
+            .map(convertUnit_EVI)
+//print("EVI",EVI)
+
+
+// first seasonal mean EVI, then yearly mean EVI
+var yearly_EVI_JunetoAugust = ee.ImageCollection.fromImages(year_list.map(function(year){
+      year = ee.Number(year)
+      return EVI.filterDate(ee.Date.fromYMD(year,6,1),ee.Date.fromYMD(year,9,1)).mean()
+                .set('system:time_start',ee.Date.fromYMD(year,1,1).millis())
+      })).toBands().rename(bandname)
+print("yearly_EVI_JunetoAugust",yearly_EVI_JunetoAugust)
+
+
+var yearly_EVI_DecembertoFebrary = ee.ImageCollection.fromImages(year_list.map(function(year){
+      year = ee.Number(year)
+      return EVI.filterDate(ee.Date.fromYMD(year,12,1),ee.Date.fromYMD(year.add(1),3,1)).mean()
+                .set('system:time_start',ee.Date.fromYMD(year,1,1).millis())
+      })).toBands().rename(bandname)
+print("yearly_EVI_DecembertoFebrary",yearly_EVI_DecembertoFebrary)
+
+var yearly_EVIsummer_NH = yearly_EVI_JunetoAugust.updateMask(NH)
+var yearly_EVIsummer_SH = yearly_EVI_DecembertoFebrary.updateMask(SH)
+
+var yearly_EVI = ee.ImageCollection([yearly_EVIsummer_NH,yearly_EVIsummer_SH]).mosaic()
+print("yearly_EVI",yearly_EVI)
+
+
+
+
+
+// WSAdata
+var convertUnit_WSA = function(image){
+  return image.multiply(0.001).copyProperties(image,['system:time_start','system:time_end'])
+}
+
+var WSA = ee.ImageCollection("MODIS/061/MCD43A3").select('Albedo_WSA_shortwave')
+            .map(convertUnit_WSA)
+//print("WSA",WSA)
+
+
+// first seasonal mean WSA, then yearly mean WSA
+var yearly_WSA_JunetoAugust = ee.ImageCollection.fromImages(year_list.map(function(year){
+      year = ee.Number(year)
+      return WSA.filterDate(ee.Date.fromYMD(year,6,1),ee.Date.fromYMD(year,9,1)).mean()
+                .set('system:time_start',ee.Date.fromYMD(year,1,1).millis())
+      })).toBands().rename(bandname).resample('bilinear').reproject({crs: ee.Image("MODIS/061/MYD11A2/2002_07_04").projection(),scale: 1000})
+print("yearly_WSA_JunetoAugust",yearly_WSA_JunetoAugust)
+
+
+var yearly_WSA_DecembertoFebrary = ee.ImageCollection.fromImages(year_list.map(function(year){
+      year = ee.Number(year)
+      return WSA.filterDate(ee.Date.fromYMD(year,12,1),ee.Date.fromYMD(year.add(1),3,1)).mean()
+                .set('system:time_start',ee.Date.fromYMD(year,1,1).millis())
+      })).toBands().rename(bandname).resample('bilinear').reproject({crs: ee.Image("MODIS/061/MYD11A2/2002_07_04").projection(),scale: 1000})
+print("yearly_WSA_DecembertoFebrary",yearly_WSA_DecembertoFebrary)
+
+var yearly_WSAsummer_NH = yearly_WSA_JunetoAugust.updateMask(NH)
+var yearly_WSAsummer_SH = yearly_WSA_DecembertoFebrary.updateMask(SH)
+
+var yearly_WSA = ee.ImageCollection([yearly_WSAsummer_NH,yearly_WSAsummer_SH]).mosaic()
+print("yearly_WSA",yearly_WSA)
+
+
+
+
+
+// POPdata
+var calculate_log = function(image){return image.log10()}
+
+var POP = ee.ImageCollection("projects/sat-io/open-datasets/ORNL/LANDSCAN_GLOBAL")
+            .map(calculate_log)
+//print("POP",POP)
+
+var yearly_POP = ee.ImageCollection.fromImages(year_list.map(function(year){
+      year = ee.Number(year)
+      var dateStart = ee.Date.fromYMD(year,1,1)
+      var dateEnd = ee.Date.fromYMD(year.add(1),1,1)
+
+      var yearPOP = POP.filterDate(dateStart,dateEnd).first()
+      return ee.Image(yearPOP).set('system:time_start',ee.Date.fromYMD(year,1,1).millis())         
+    
+})).toBands().rename(bandname)
+
+//print("yearly_POP",yearly_POP)
+
+
+
+
+// NTLdata
+var NTL = ee.ImageCollection("projects/sat-io/open-datasets/npp-viirs-ntl")
+//print("NTL",NTL)
+
+var yearly_NTL = ee.ImageCollection.fromImages(year_list.map(function(year){
+      year = ee.Number(year)
+      var dateStart = ee.Date.fromYMD(year,1,1)
+      var dateEnd = ee.Date.fromYMD(year.add(1),1,1)
+
+      var yearNTL = NTL.filterDate(dateStart,dateEnd).first()
+      return ee.Image(yearNTL).set('system:time_start',ee.Date.fromYMD(year,1,1).millis())         
+    
+})).toBands().rename(bandname)
+
+//print("yearly_NTL",yearly_NTL)
+
+
+
+
+// SATdata
+var convertUnit_SAT = function(image){
+  return image.subtract(273.15).copyProperties(image,['system:time_start','system:time_end'])
+}
+
+var SAT = ee.ImageCollection("ECMWF/ERA5_LAND/MONTHLY_AGGR").select('temperature_2m_max')
+                      .map(convertUnit_SAT)
+
+// first seasonal mean SAT, then yearly mean SAT
+var yearly_SAT_JunetoAugust = ee.ImageCollection.fromImages(year_list.map(function(year){
+      year = ee.Number(year)
+      return SAT.filterDate(ee.Date.fromYMD(year,6,1),ee.Date.fromYMD(year,9,1)).mean()
+                .set('system:time_start',ee.Date.fromYMD(year,1,1).millis())
+      })).toBands().rename(bandname).resample('bilinear').reproject({crs: ee.Image("MODIS/061/MYD11A2/2002_07_04").projection(),scale: 1000})
+print("yearly_SAT_JunetoAugust",yearly_SAT_JunetoAugust)
+
+
+var yearly_SAT_DecembertoFebrary = ee.ImageCollection.fromImages(year_list.map(function(year){
+      year = ee.Number(year)
+      return SAT.filterDate(ee.Date.fromYMD(year,12,1),ee.Date.fromYMD(year.add(1),3,1)).mean()
+                .set('system:time_start',ee.Date.fromYMD(year,1,1).millis())
+      })).toBands().rename(bandname).resample('bilinear').reproject({crs: ee.Image("MODIS/061/MYD11A2/2002_07_04").projection(),scale: 1000})
+print("yearly_SAT_DecembertoFebrary",yearly_SAT_DecembertoFebrary)
+
+var yearly_SATsummer_NH = yearly_SAT_JunetoAugust.updateMask(NH)
+var yearly_SATsummer_SH = yearly_SAT_DecembertoFebrary.updateMask(SH)
+
+var yearly_SAT = ee.ImageCollection([yearly_SATsummer_NH,yearly_SATsummer_SH]).mosaic()
+print("yearly_SAT",yearly_SAT)
+
+
+
+
+
+// DPTdata
+var convertUnit_DPT = function(image){
+  return image.subtract(273.15).copyProperties(image,['system:time_start','system:time_end'])
+}
+
+var DPT = ee.ImageCollection("ECMWF/ERA5_LAND/MONTHLY_AGGR").select('dewpoint_temperature_2m_max')
+                      .map(convertUnit_DPT)
+
+// first seasonal mean DPT, then yearly mean DPT
+var yearly_DPT_JunetoAugust = ee.ImageCollection.fromImages(year_list.map(function(year){
+      year = ee.Number(year)
+      return DPT.filterDate(ee.Date.fromYMD(year,6,1),ee.Date.fromYMD(year,9,1)).mean()
+                .set('system:time_start',ee.Date.fromYMD(year,1,1).millis())
+      })).toBands().rename(bandname).resample('bilinear').reproject({crs: ee.Image("MODIS/061/MYD11A2/2002_07_04").projection(),scale: 1000})
+print("yearly_DPT_JunetoAugust",yearly_DPT_JunetoAugust)
+
+
+var yearly_DPT_DecembertoFebrary = ee.ImageCollection.fromImages(year_list.map(function(year){
+      year = ee.Number(year)
+      return DPT.filterDate(ee.Date.fromYMD(year,12,1),ee.Date.fromYMD(year.add(1),3,1)).mean()
+                .set('system:time_start',ee.Date.fromYMD(year,1,1).millis())
+      })).toBands().rename(bandname).resample('bilinear').reproject({crs: ee.Image("MODIS/061/MYD11A2/2002_07_04").projection(),scale: 1000})
+print("yearly_DPT_DecembertoFebrary",yearly_DPT_DecembertoFebrary)
+
+var yearly_DPTsummer_NH = yearly_DPT_JunetoAugust.updateMask(NH)
+var yearly_DPTsummer_SH = yearly_DPT_DecembertoFebrary.updateMask(SH)
+
+var yearly_DPT = ee.ImageCollection([yearly_DPTsummer_NH,yearly_DPTsummer_SH]).mosaic()
+print("yearly_DPT",yearly_DPT)
+
+
+
+
+
+// PREPdata
+var PREP = ee.ImageCollection("ECMWF/ERA5_LAND/MONTHLY_AGGR").select('total_precipitation_sum')
+
+// first seasonal mean PREP, then yearly mean PREP
+var yearly_PREP_JunetoAugust = ee.ImageCollection.fromImages(year_list.map(function(year){
+      year = ee.Number(year)
+      return PREP.filterDate(ee.Date.fromYMD(year,6,1),ee.Date.fromYMD(year,9,1)).mean()
+                 .set('system:time_start',ee.Date.fromYMD(year,1,1).millis())
+      })).toBands().rename(bandname).resample('bilinear').reproject({crs: ee.Image("MODIS/061/MYD11A2/2002_07_04").projection(),scale: 1000})
+print("yearly_PREP_JunetoAugust",yearly_PREP_JunetoAugust)
+
+
+var yearly_PREP_DecembertoFebrary = ee.ImageCollection.fromImages(year_list.map(function(year){
+      year = ee.Number(year)
+      return PREP.filterDate(ee.Date.fromYMD(year,12,1),ee.Date.fromYMD(year.add(1),3,1)).mean()
+                 .set('system:time_start',ee.Date.fromYMD(year,1,1).millis())
+      })).toBands().rename(bandname).resample('bilinear').reproject({crs: ee.Image("MODIS/061/MYD11A2/2002_07_04").projection(),scale: 1000})
+print("yearly_PREP_DecembertoFebrary",yearly_PREP_DecembertoFebrary)
+
+var yearly_PREPsummer_NH = yearly_PREP_JunetoAugust.updateMask(NH)
+var yearly_PREPsummer_SH = yearly_PREP_DecembertoFebrary.updateMask(SH)
+
+var yearly_PREP = ee.ImageCollection([yearly_PREPsummer_NH,yearly_PREPsummer_SH]).mosaic()
+print("yearly_PREP",yearly_PREP)
+
+
+
+
+
+// RADdata
+var convertUnit_RAD = function(image){
+  return image.divide(30*24*60*60).copyProperties(image,['system:time_start','system:time_end'])
+}
+
+var RAD = ee.ImageCollection("ECMWF/ERA5_LAND/MONTHLY_AGGR").select('surface_net_solar_radiation_sum')
+            .map(convertUnit_RAD)
+
+// first seasonal mean RAD, then yearly mean RAD
+var yearly_RAD_JunetoAugust = ee.ImageCollection.fromImages(year_list.map(function(year){
+      year = ee.Number(year)
+      return RAD.filterDate(ee.Date.fromYMD(year,6,1),ee.Date.fromYMD(year,9,1)).mean()
+                .set('system:time_start',ee.Date.fromYMD(year,1,1).millis())
+      })).toBands().rename(bandname).resample('bilinear').reproject({crs: ee.Image("MODIS/061/MYD11A2/2002_07_04").projection(),scale: 1000})
+print("yearly_RAD_JunetoAugust",yearly_RAD_JunetoAugust)
+
+
+var yearly_RAD_DecembertoFebrary = ee.ImageCollection.fromImages(year_list.map(function(year){
+      year = ee.Number(year)
+      return RAD.filterDate(ee.Date.fromYMD(year,12,1),ee.Date.fromYMD(year.add(1),3,1)).mean()
+                .set('system:time_start',ee.Date.fromYMD(year,1,1).millis())
+      })).toBands().rename(bandname).resample('bilinear').reproject({crs: ee.Image("MODIS/061/MYD11A2/2002_07_04").projection(),scale: 1000})
+print("yearly_RAD_DecembertoFebrary",yearly_RAD_DecembertoFebrary)
+
+var yearly_RADsummer_NH = yearly_RAD_JunetoAugust.updateMask(NH)
+var yearly_RADsummer_SH = yearly_RAD_DecembertoFebrary.updateMask(SH)
+
+var yearly_RAD = ee.ImageCollection([yearly_RADsummer_NH,yearly_RADsummer_SH]).mosaic()
+print("yearly_RAD",yearly_RAD)
+
+
+
+
+var finalImage_WBGT = ee.ImageCollection(bandname.map(function(year){
+      
+      var yearImage = ee.Image.constant(ee.Number.parse(year)).rename('year')
+                   .resample('bilinear')
+                   .reproject({crs: ee.Image("MODIS/061/MYD11A2/2002_07_04").projection(),scale: 1000})
+                   
+      var lati = geolocation.select('lati')
+      var longi = geolocation.select('longi')
+      var elevation = geolocation.select('elevation')
+      
+      var LST = yearly_LST.select(ee.List([year])).rename('LST')
+      var EVI = yearly_EVI.select(ee.List([year])).rename('EVI')
+      var WSA = yearly_WSA.select(ee.List([year])).rename('WSA')
+      var POP = yearly_POP.select(ee.List([year])).rename('POP')
+      var NTL = yearly_NTL.select(ee.List([year])).rename('NTL')
+      
+      var SAT = yearly_SAT.select(ee.List([year])).rename('reanalysisSAT')
+      var DPT = yearly_DPT.select(ee.List([year])).rename('reanalysisDPT')
+      var PREP = yearly_PREP.select(ee.List([year])).rename('reanalysisPREP')
+      var RAD = yearly_RAD.select(ee.List([year])).rename('reanalysisRAD')
+      
+      return yearImage.addBands(lati).addBands(longi).addBands(elevation)
+                 .addBands(LST).addBands(EVI).addBands(WSA).addBands(POP).addBands(NTL)
+                 .addBands(SAT).addBands(DPT).addBands(PREP).addBands(RAD)
+                 .set('year',year)
+
+}))
+
+//print("finalImage_WBGT",finalImage_WBGT)
+
+
+var yearly_SOUTH_WBGT = finalImage_WBGT.map(function(image){
+  return image.classify(SOUTH_rfModel, 'predictedWBGT').set('year',image.get('year'))
+}).toBands().rename(bandname)
+print("yearly_SOUTH_WBGT",yearly_SOUTH_WBGT)
+
+
+
+var global_center = ee.FeatureCollection("users/continental/GRL_center5643")
+
+var SOUTH_center = global_center.filter(ee.Filter.eq('NS',200)).aggregate_array('ORIG_FID')
+//print("SOUTH_center",SOUTH_center)
+
+
+var SOUTH_urban = ee.FeatureCollection("users/continental/GRL_urban5643")
+                    .filter(ee.Filter.inList('ORIG_FID',SOUTH_center))
+//print("SOUTH_urban",SOUTH_urban)
+
+
+var SOUTH_citylist = SOUTH_urban.aggregate_array('ORIG_FID')
+print("SOUTH_citylist",SOUTH_citylist)
+
+
+for(var SOUTH_j=0;SOUTH_j<2368;SOUTH_j+=30){   
+    
+    var SOUTH_ID_group = SOUTH_citylist.slice(SOUTH_j,SOUTH_j+30)
+    
+    var SOUTH_final_fc = ee.FeatureCollection(SOUTH_ID_group.map(function(city_i){
+          var urban_i = SOUTH_urban.filter(ee.Filter.eq('ORIG_FID', city_i)).first()
+          var SATurban = yearly_SOUTH_WBGT.reduceRegion(ee.Reducer.mean(),ee.Feature(urban_i).geometry(),1000,null,null,false,10e12,4)
+          return ee.Feature(null,SATurban).set('ORIG_FID',city_i)
+    }))
+  
+    print("SOUTH_final_fc", SOUTH_final_fc)
+
+    Export.table.toDrive({
+            collection: SOUTH_final_fc,
+            folder:"global_predictedHI_day_summer_2003to2022",
+            description: 'SOUTH_predictedHI_day_'+SOUTH_j,
+            selectors: outputSelectors,
+            fileFormat: 'CSV'
+    })
+}  
+
