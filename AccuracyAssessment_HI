@@ -1,0 +1,49 @@
+
+var global_features = ee.FeatureCollection("projects/ee-continental/assets/HadISD_XY_HI_day_summer_03to22")
+                 .map(function(feature){
+                       var location = feature.geometry().coordinates()
+                       return feature.setMulti({'lati':location.get(1),'longi':location.get(0)})
+                 })
+//print("global_features",global_features.size())
+
+
+var global_urban_features = global_features.filter(ee.Filter.eq('UR',1))
+
+var SOUTH_urban_features = global_urban_features.filter(ee.Filter.eq('NS',200))
+//print("SOUTH_urban_features",SOUTH_urban_features.size())
+
+
+var classifier = ee.Classifier.smileRandomForest(100, null, 1, 0.5, null, 0).setOutputMode("REGRESSION")
+
+var independent_variable = ["year","lati", "longi", "elevation", 
+                            "LST","EVI", "WSA", "POP", "NTL",
+                            "reanalysisSAT", "reanalysisDPT","reanalysisPREP", "reanalysisRAD"]
+
+
+// global south
+var SOUTH_random_number = SOUTH_urban_features.aggregate_array('ID').shuffle()
+
+var SOUTH_training_ID = SOUTH_random_number.slice(0,SOUTH_urban_features.size().multiply(0.8).toInt())
+var SOUTH_testing_ID = SOUTH_random_number.removeAll(SOUTH_training_ID)
+
+var SOUTH_trainingData = SOUTH_urban_features.filter(ee.Filter.inList("ID",SOUTH_training_ID))
+var SOUTH_testingData = SOUTH_urban_features.filter(ee.Filter.inList("ID",SOUTH_testing_ID))
+
+print("SOUTH_trainingData",SOUTH_trainingData.size())
+print("SOUTH_testingData",SOUTH_testingData.size())
+
+var SOUTH_rfModel = classifier.train(SOUTH_trainingData, "HI", independent_variable)
+var SOUTH_regression = ee.FeatureCollection(SOUTH_testingData.classify(SOUTH_rfModel, 'predicted'))
+
+print("SOUTH_rfModel",SOUTH_rfModel)
+print("SOUTH_regression",SOUTH_regression)
+
+
+Export.table.toDrive({
+        collection: SOUTH_regression,
+        folder:"HI_RFmodels",
+        description: 'HIday_SOUTH',
+        selectors: ['ID','year','HI','predicted'],
+        fileFormat: 'CSV'
+})
+
